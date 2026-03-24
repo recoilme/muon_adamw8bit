@@ -1,6 +1,6 @@
 import torch
 import bitsandbytes as bnb
-from typing import Optional
+from typing import Optional, Union, List, Dict, Any
 
 def zeropower_via_newtonschulz5(
     G: torch.Tensor, 
@@ -17,11 +17,11 @@ def zeropower_via_newtonschulz5(
         steps (int): Number of Newton-Schulz iterations. Default: 10.
         eps (float): Epsilon for numerical stability. Default: 1e-7.
         dtype (Optional[torch.dtype]): Data type for computation. 
-            - If torch.bfloat16 (default): casts input to bf16 for speed.
-            - If None: uses the input tensor's dtype.
+            - torch.bfloat16 (default): Fast and stable on modern GPUs.
+            - None: Uses the input tensor's dtype (e.g., FP32).
     
     Returns:
-        torch.Tensor: Orthogonalized update matrix in the original input dtype (if cast) or compute dtype.
+        torch.Tensor: Orthogonalized update matrix.
     
     Example:
         >>> grad = torch.randn(64, 64)
@@ -34,8 +34,6 @@ def zeropower_via_newtonschulz5(
         X = G.to(dtype)
     else:
         X = G
-        # Safety: FP16 is often unstable for NS iterations without careful scaling, 
-        # but we respect the user choice if dtype=None and input is fp16.
 
     # Transpose logic for efficiency (M > N)
     transposed = X.size(-2) > X.size(-1)
@@ -57,7 +55,6 @@ def zeropower_via_newtonschulz5(
 class MuonInternal(torch.optim.Optimizer):
     """
     Internal Muon optimizer logic for matrix parameters (weights).
-    Implements momentum orthogonalization.
     """
     def __init__(
         self, 
@@ -97,7 +94,7 @@ class MuonInternal(torch.optim.Optimizer):
                 
                 buf = state["momentum_buffer"]
                 
-                # Weight Decay (Decoupled, similar to AdamW)
+                # Weight Decay (Decoupled)
                 if weight_decay != 0.0:
                     p.mul_(1 - lr * weight_decay)
                 
@@ -122,7 +119,6 @@ class MuonInternal(torch.optim.Optimizer):
                 if g.ndim == 4:
                     update = update.view(original_shape)
                 
-                # Cast back to param dtype if necessary (usually float32/bfloat16)
                 p.add_(update, alpha=-lr)
                 
         return loss
@@ -132,30 +128,16 @@ class MuonAdamW8bit(torch.optim.Optimizer):
     """
     Hybrid Optimizer: Muon for matrices (weights) + AdamW8bit for scalars (biases, norms).
     
-    This optimizer automatically separates parameters based on their dimensionality.
-    - Parameters with ndim >= 2 (Weights, Convs) are optimized using Muon.
-    - Parameters with ndim < 2 (Biases, LayerNorms) are optimized using AdamW8bit.
-    
-    It handles Learning Rate scheduling correctly by synchronizing LR between Adam and Muon groups.
+    Automatically separates parameters based on dimensionality.
     
     Args:
-        params: Model parameters (can be a generator or list of dicts).
-        lr (float): Base learning rate for AdamW.
-        betas (tuple): Betas for AdamW.
-        eps (float): Epsilon for AdamW.
-        weight_decay (float): Weight decay coefficient.
-        muon_lr_mult (float): Multiplier for Muon LR relative to base LR. 
-                              Muon typically requires higher LR (e.g., x1000).
-                              Default: 1000.0.
-        muon_momentum (float): Momentum for Muon. Default: 0.95.
-        ns_steps (int): Newton-Schulz iterations. Default: 5.
-        ns_dtype (torch.dtype): Precision for Newton-Schulz. Default: torch.bfloat16.
+        params: Model parameters (generator, list of tensors, or list of param groups).
+        lr (float): Base learning rate. Default: 1e-3.
+        muon_lr_mult (float): Multiplier for Muon LR. Default: 1000.0.
+        ns_dtype (Optional[torch.dtype]): Precision for Newton-Schulz. Default: torch.bfloat16.
     
     Example:
-        >>> model = MyModel()
-        >>> opt = MuonAdamW8bit(model.parameters(), lr=1e-5, muon_lr_mult=1000)
-        >>> loss.backward()
-        >>> opt.step()
+        >>> opt = MuonAdamW8bit(model.parameters(), lr=1e-5)
     """
     def __init__(
         self, 
@@ -176,13 +158,32 @@ class MuonAdamW8bit(torch.optim.Optimizer):
         self.ns_steps = ns_steps
         self.ns_dtype = ns_dtype
         
-        # Split parameters
+        # --- ROBUST INPUT HANDLING ---
+        # Convert generator/iterator to list to handle it safely
+        params_list = list(params)
+        
+        param_groups_input = []
+
+        if len(params_list) > 0:
+            # Check if it's a list of dictionaries (param groups)
+            # We check the first element.
+            if isinstance(params_list[0], dict):
+                # It looks like param groups. Validate them.
+                for i, group in enumerate(params_list):
+                    if not isinstance(group, dict):
+                         raise ValueError(f"Parameter at index {i} is a dict, but element at {i} is not. Mixed input is not supported.")
+                    if 'params' not in group:
+                         raise ValueError(f"Parameter group at index {i} is missing 'params' key. Check your input.")
+                param_groups_input = params_list
+            else:
+                # It's a list of tensors (parameters). Wrap it.
+                param_groups_input = [{'params': params_list}]
+        
+        # Split parameters into Muon (matrix) and Adam (scalar) groups
         muon_groups = []
         adam_groups = []
         
-        params = list(params)
-        
-        for group in params:
+        for group in param_groups_input:
             group_params = group['params']
             group_args = {k: v for k, v in group.items() if k != 'params'}
             
@@ -190,6 +191,10 @@ class MuonAdamW8bit(torch.optim.Optimizer):
             scalar_ps = []
             
             for p in group_params:
+                # Filter non-tensors just in case
+                if not isinstance(p, torch.Tensor):
+                    continue
+                    
                 if p.ndim >= 2:
                     matrix_ps.append(p)
                 else:
@@ -201,7 +206,6 @@ class MuonAdamW8bit(torch.optim.Optimizer):
                 adam_groups.append({'params': scalar_ps, **group_args})
 
         # Initialize internal optimizers
-        # Muon handles its own weight decay logic internally
         self.muon_opt = MuonInternal(
             muon_groups, 
             lr=actual_muon_lr, 
@@ -211,7 +215,6 @@ class MuonAdamW8bit(torch.optim.Optimizer):
             ns_dtype=ns_dtype
         )
         
-        # AdamW8bit handles weight decay via bnb implementation
         self.adam_opt = bnb.optim.AdamW8bit(
             adam_groups, 
             lr=lr, 
@@ -223,19 +226,7 @@ class MuonAdamW8bit(torch.optim.Optimizer):
         self.defaults = dict(lr=lr)
         self.state = {}
         
-        # AdamW8bit handles weight decay via standard arguments
-        self.adam_opt = bnb.optim.AdamW8bit(
-            adam_groups, 
-            lr=lr, 
-            betas=betas, 
-            eps=eps, 
-            weight_decay=weight_decay
-        )
-
-        self.defaults = dict(lr=lr)
-        self.state = {}
-        
-        # For Accelerate/LR Scheduler compatibility, expose Adam's param_groups
+        # For Accelerate/LR Scheduler compatibility
         self.param_groups = self.adam_opt.param_groups
 
     def zero_grad(self, set_to_none=False):
@@ -245,8 +236,6 @@ class MuonAdamW8bit(torch.optim.Optimizer):
     @torch.no_grad()
     def step(self, closure=None):
         # LR Synchronization
-        # Accelerate updates LR in `optimizer.param_groups` (which is Adam's groups here).
-        # We sync the updated LR to Muon groups applying the scale.
         if len(self.adam_opt.param_groups) > 0:
             current_base_lr = self.adam_opt.param_groups[0]['lr']
             for group in self.muon_opt.param_groups:
