@@ -160,7 +160,7 @@ class MuonAdamW8bit(torch.optim.Optimizer):
     def __init__(
         self, 
         params, 
-        lr: float = 1e-5, 
+        lr: float = 4e-5, 
         betas: tuple = (0.9, 0.995), 
         eps: float = 1e-7, 
         weight_decay: float = 0.01, 

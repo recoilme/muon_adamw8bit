@@ -8,32 +8,24 @@ pip install git+https://github.com/recoilme/muon_adamw8bit.git
 
 # Usage
 ```
-from muon_optimizer import MuonAdamW8bit
+import torch
+from muon_adamw8bit import MuonAdamW8bit
 
-# ... define model ...
+model = MyModel()
 
-# Example 1: Basic usage
+# Initialize optimizer
+# Muon requires higher LR. If base_lr=4e-5, muon_lr_mult=1000 results in 0.04 for Muon.
 optimizer = MuonAdamW8bit(
-    vae.parameters(), 
-    lr=6e-6, 
-    muon_lr_mult=1000,     # Muon LR will be 6e-6 * 1000 = 0.006
-    ns_dtype=torch.bfloat16 # Default, safe and fast. Use None for input dtype.
+    model.parameters(),
+    lr=4e-5,
+    muon_lr_mult=1000.0,       # Default: 1000.0
+    ns_dtype=torch.bfloat16    # Default: torch.bfloat16. Use None for input dtype.
 )
 
-# Example 2: With parameter groups (e.g., weight decay)
-optimizer = MuonAdamW8bit(
-    param_groups,           # list of dicts [{'params': ...}, ...]
-    lr=6e-6,
-    weight_decay=0.01,
-    muon_lr_mult=1500
-)
-
-# Training loop
-for batch in dataloader:
-    loss = compute_loss(...)
-    loss.backward()
-    optimizer.step()
-    optimizer.zero_grad()
+# Standard training loop
+loss.backward()
+optimizer.step()
+optimizer.zero_grad()
 ```
 # Features
 
