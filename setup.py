@@ -9,7 +9,7 @@ if os.path.exists("README.md"):
 
 setup(
     name="muon-adamw8bit",
-    version="0.2.0",
+    version="0.3.0",
     author="recoilme",
     author_email="vadim-kulibaba@yandex.ru",
     description="Hybrid Muon + AdamW8bit optimizer for PyTorch. Handles matrices with Muon and scalars with 8-bit Adam.",
