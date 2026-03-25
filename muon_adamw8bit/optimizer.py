@@ -12,22 +12,17 @@ def zeropower_via_newtonschulz5(
     """
     a, b, c = (3.4445, -4.7750, 2.0315)
     
-    # Логика старой версии: считаем в точности входного типа (BF16/FP32)
-    # Если пришло FP16, лучше поднять до FP32 (или BF16), так как FP16 плохо для точности степеней.
     if G.dtype == torch.float16:
         X = G.float()
     else:
         X = G
 
-    # Transpose logic for efficiency (M > N)
     transposed = X.size(-2) > X.size(-1)
     if transposed:
         X = X.mT
     
-    # Normalization
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
     
-    # Iterations
     for _ in range(steps):
         A = X @ X.mT
         B = b * A + c * A @ A
@@ -75,10 +70,8 @@ class MuonInternal(torch.optim.Optimizer):
                 
                 buf = state["momentum_buffer"]
                 
-                # Momentum update
                 buf.mul_(momentum).add_(g.float())
                 
-                # Nesterov lookahead
                 update = g.float().add(buf, alpha=momentum)
                 
                 original_shape = g.shape
@@ -87,13 +80,10 @@ class MuonInternal(torch.optim.Optimizer):
                 if needs_reshaping:
                     update = update.reshape(update.size(0), -1)
                 
-                # Orthogonalization
                 update = zeropower_via_newtonschulz5(update, steps=ns_steps)
                 
-                # Scaling
                 update *= max(1, update.size(-2) / update.size(-1)) ** 0.5
                 
-                # Restore shape
                 if needs_reshaping:
                     update = update.reshape(original_shape)
                 
@@ -105,6 +95,7 @@ class MuonInternal(torch.optim.Optimizer):
 class MuonAdamW8bit(torch.optim.Optimizer):
     """
     Hybrid Optimizer: Muon + AdamW8bit.
+    KISS Fix: Muon использует фиксированный LR, Adam использует LR от шедулера.
     """
     def __init__(
         self, 
@@ -151,7 +142,7 @@ class MuonAdamW8bit(torch.optim.Optimizer):
             if scalar_ps:
                 adam_groups.append({'params': scalar_ps, **group_args})
 
-        # LR
+        # Фиксируем LR для Muon один раз при инициализации
         actual_muon_lr = lr * muon_lr_mult
         self.muon_lr_scale = muon_lr_mult
         self.ns_steps = ns_steps
@@ -174,7 +165,7 @@ class MuonAdamW8bit(torch.optim.Optimizer):
         self.defaults = dict(lr=lr)
         self.state = {}
         
-        # Совместимость с шедулерами
+        # Шедулер будет дергать param_groupsAdam, а Muon будет жить своей жизнью
         if len(self.adam_opt.param_groups) > 0:
             self.param_groups = self.adam_opt.param_groups
         elif len(self.muon_opt.param_groups) > 0:
@@ -188,12 +179,12 @@ class MuonAdamW8bit(torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
-        # Синхронизация LR
-        if len(self.adam_opt.param_groups) > 0:
-            current_base_lr = self.adam_opt.param_groups[0]['lr']
-            for group in self.muon_opt.param_groups:
-                group['lr'] = current_base_lr * self.muon_lr_scale
-            
+        # --- KISS решение ---
+        # Мы УБРАЛИ синхронизацию LR.
+        # Muon продолжает использовать LR, заданный в __init__ (actual_muon_lr).
+        # Adam использует LR, который меняет шедулер (с прогревом).
+        # Это безопасно, так как Muon устойчив к высокому LR.
+        
         self.muon_opt.step(closure)
         self.adam_opt.step(closure)
 
@@ -207,7 +198,7 @@ class MuonAdamW8bit(torch.optim.Optimizer):
         self.muon_opt.load_state_dict(state_dict['muon'])
         self.adam_opt.load_state_dict(state_dict['adam'])
         
-        # Обновляем ссылки после загрузки
+        # Восстанавливаем ссылки
         if len(self.adam_opt.param_groups) > 0:
             self.param_groups = self.adam_opt.param_groups
         elif len(self.muon_opt.param_groups) > 0:
